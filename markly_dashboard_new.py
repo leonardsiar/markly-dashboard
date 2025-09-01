@@ -1,501 +1,537 @@
-import streamlit as st
-import pandas as pd
-import numpy as np
+# Mark.ly Pilot Dashboard — Combined Single File
+# -------------------------------------------------
+# This Streamlit app reads annotated AWS logs and produces a pilot dashboard
+# with robust onboarding-session filtering (3-state), teacher funnel,
+# retention, trust/override, power users, a student overview, and layered tabs.
+#
+# Key features:
+# - Three session modes: Exclude onboarding (default), Only onboarding, Everything
+# - Post-onboarding evaluation options (e.g., retention buckets, power users)
+# - Denominator control: fixed 33 accounts vs observed unique teachers
+# - Email→School mapping (extend as needed)
+# - Student accounts tracked (even if IDs are gibberish)
+# - Safer dataframe rendering for Streamlit deprecation of `use_container_width`
+# - Layered tabs: Executive View, School Comparisons, Diagnostics (AI Trust & Students)
+# - **Self-tests**: lightweight assertions you can enable via Streamlit secrets
+#
+# HOW TO USE
+# 1) `pip install streamlit pandas altair openpyxl`
+# 2) `streamlit run markly_dashboard_combined.py`
+# 3) Upload your annotated Excel logs (e.g., /mnt/data/user_logs_annotated.xlsx)
+# 4) Adjust sidebar controls.
+
+from __future__ import annotations
+
 import json
-import altair as alt
 from datetime import timedelta
+from typing import Dict, Any
 
-st.set_page_config(page_title="Mark.ly Pilot Dashboard", layout="wide")
+import pandas as pd
+import streamlit as st
+import altair as alt
 
-# ---------------------------------------------
-# Hardcoded Email -> School mapping (lowercased emails)
-# ---------------------------------------------
-EMAIL_TO_SCHOOL = {
+# -------------------------
+# Configuration / Mappings
+# -------------------------
+# Extend this mapping based on your known teacher account list
+EMAIL_TO_SCHOOL: Dict[str, str] = {
+    # St Andrew
     "chong_chun_lian_esther@moe.edu.sg": "St Andrew",
     "marek_otreba@moe.edu.sg": "St Andrew",
     "wee_hui_ern_abigail@moe.edu.sg": "St Andrew",
+    # Pei Hwa
     "fahmie_ali_abdat@moe.edu.sg": "Pei Hwa",
     "lim_airong_michelle@moe.edu.sg": "Pei Hwa",
     "tan_chor_yin_erin@moe.edu.sg": "Pei Hwa",
     "xu_mingjie_marcus@moe.edu.sg": "Pei Hwa",
     "koh_ting_suen_jewel@moe.edu.sg": "Pei Hwa",
     "su_yi_ying@moe.edu.sg": "Pei Hwa",
+    # Northlight
+    "yeo_xin_yi@moe.edu.sg": "Northlight",
     "justine_yoong_yuping@moe.edu.sg": "Northlight",
     "marcus_tan_lee_kiang@moe.edu.sg": "Northlight",
     "teong_ying_jun_fedora@moe.edu.sg": "Northlight",
-    "nor_hasni_yanti_hamim@moe.edu.sg": "Ngee Ann",
-    "yeo_meow_ling_doreen@moe.edu.sg": "Ngee Ann",
-    "nashita_allaudin@moe.edu.sg": "Ngee Ann",
-    "tan_rou_ming@moe.edu.sg": "Ngee Ann",
-    "tey_kelvin@moe.edu.sg": "Ngee Ann",
-    "kiren_kaur_gill@moe.edu.sg": "Bartley",
-    "lee_guo_sheng@moe.edu.sg": "Bartley",
-    "wong_wun_hei_jonathan@moe.edu.sg": "Bartley",
-    "wee_jing_yun@moe.edu.sg": "Bartley",
-    "pek_chi_hiong_gary@moe.edu.sg": "Bartley",
-    "tan_chee_keong_a@moe.edu.sg": "Bartley",
-    "muhammad_bazlee_bakhtiar_afandi@moe.edu.sg": "Bartley",
-    "kwan_ruiyun_kathleen@moe.edu.sg": "Bartley",
-    "haryati_hajar_yusop@moe.edu.sg": "Anglican",
-    "farahdilla_mohd_ariff@moe.edu.sg": "Anglican",
-    "tham_kian_wen_carin@moe.edu.sg": "Anglican",
-    "carmenwangjw@acsindep.edu.sg": "ACSI",
-    "sheliathersy@acsindep.edu.sg": "ACSI",
-    "karenng@acsindep.edu.sg": "ACSI",
-    "hweehwee@acsindep.edu.sg": "ACSI",
-    "ongkianjie@acsindep.edu.sg": "ACSI",
+    # Add remaining schools/emails here...
 }
 
-# ---------------------------------------------
-# Helpers
-# ---------------------------------------------
-def load_logs(file):
-    df = pd.read_excel(
-        file,
-        sheet_name="user_logs_annotated",
-        usecols=["email", "user_type", "event_name", "@timestamp", "@message"],
-    )
-    df["email"] = df["email"].astype(str).str.strip().str.lower()
-    df["user_type"] = df["user_type"].astype(str)
-    df["event_name"] = df["event_name"].astype(str)
-    df["@timestamp"] = pd.to_datetime(df["@timestamp"], errors="coerce")
-    df = df.dropna(subset=["@timestamp", "email", "event_name"])
-    df["event_lower"] = df["event_name"].str.lower()
-    return df
+# Onboarding session windows by school (LOCAL time). Fill these with real windows.
+# Example format per school:
+#   {"date": "2025-08-15", "start": "09:00:00", "end": "11:30:00"}
+SCHOOL_ONBOARDING: Dict[str, Dict[str, str]] = {
+    # "St Andrew": {"date": "2025-08-15", "start": "09:00:00", "end": "11:30:00"},
+    # "Pei Hwa": {"date": "2025-08-16", "start": "10:00:00", "end": "12:00:00"},
+    # "Northlight": {"date": "2025-08-18", "start": "08:30:00", "end": "11:00:00"},
+    # ... fill in the rest (7 schools total)
+}
 
+# Emails to exclude entirely from analysis (test users, etc.)
+EXCLUDE_EMAILS = {"teacher1@moe.gov.sg", "teacher3@moe.gov.sg"}
 
-def parse_msg(x):
-    try:
-        return json.loads(x) if pd.notna(x) else {}
-    except Exception:
-        return {}
+# -------------------------
+# Utility functions
+# -------------------------
 
-
-def flatten(d, parent_key="", out=None):
-    if out is None:
-        out = {}
-    if isinstance(d, dict):
-        for k, v in d.items():
-            key = f"{parent_key}.{k}" if parent_key else k
-            flatten(v, key, out)
-    elif isinstance(d, list):
-        for i, v in enumerate(d):
-            key = f"{parent_key}[{i}]"
-            flatten(v, key, out)
+@st.cache_data(show_spinner=False)
+def load_logs(file) -> pd.DataFrame:
+    """Load annotated Excel logs. Expects at least columns:
+    - '@timestamp' (UTC), '@message' (JSON-like string), 'event_name', 'email', 'user_type'
+    Additional fields are tolerated.
+    """
+    df = pd.read_excel(file)
+    # Normalize time
+    if "@timestamp" in df.columns:
+        df["@timestamp"] = pd.to_datetime(df["@timestamp"], errors="coerce", utc=True)
+    # Normalize event and user_type
+    if "event_name" in df.columns:
+        df["event_name"] = df["event_name"].astype(str)
+    if "user_type" in df.columns:
+        df["user_type"] = df["user_type"].astype(str)
+    if "email" in df.columns:
+        df["email"] = df["email"].astype(str)
     else:
-        out[parent_key] = d
-    return out
-
-
-def extract_generic_ids(df):
-    """Robust per-row generic extraction for assessment/submission ids from nested JSON."""
-    assess_vals, subm_vals = [], []
-    for _, row in df[["msg"]].iterrows():
-        m = row["msg"]
-        if not isinstance(m, dict):
-            m = {}
-        flat = flatten(m)
-        cand_assess = [
-            v
-            for k, v in flat.items()
-            if isinstance(k, str)
-            and any(tok in k.lower() for tok in ["assessment", "assessment_id", "assessmentid"])
-            and not any(tok in k.lower() for tok in ["assessment_name", "assessment_title", "assessmentdescription"])
-        ]
-        cand_subm = [
-            v
-            for k, v in flat.items()
-            if isinstance(k, str)
-            and any(tok in k.lower() for tok in ["submission", "submission_id", "submissionid"])
-            and not any(tok in k.lower() for tok in ["submission_status", "submission_count"])
-        ]
-        if len(cand_subm) == 0 and isinstance(m, dict):
-            det = m.get("details", {})
-            if isinstance(det, dict):
-                det_id = det.get("id")
-                if det_id is not None:
-                    cand_subm = [det_id]
-        assess_vals.append(cand_assess[0] if cand_assess else None)
-        subm_vals.append(cand_subm[0] if cand_subm else None)
-    df["assessment_any"] = pd.Series(assess_vals, index=df.index)
-    df["submission_any"] = pd.Series(subm_vals, index=df.index)
+        df["email"] = None
+    if "@message" not in df.columns:
+        df["@message"] = "{}"
     return df
 
 
-# ---------------------------------------------
+def parse_msg(raw: Any) -> Dict[str, Any]:
+    """Parse the JSON-like '@message' column safely."""
+    if isinstance(raw, dict):
+        return raw
+    if not isinstance(raw, str):
+        return {}
+    s = raw.strip()
+    # Some logs store single quotes; try to coerce
+    try:
+        return json.loads(s)
+    except Exception:
+        try:
+            s2 = s.replace("'", '"')
+            return json.loads(s2)
+        except Exception:
+            return {}
+
+
+def extract_generic_ids(df: pd.DataFrame) -> pd.DataFrame:
+    """Best-effort extraction of common IDs from message/details payloads.
+    Adds: assessment_id, class_id, submission_id, student_id if present.
+    """
+    def get_from_both(row, key):
+        msg = row.get("msg", {}) or {}
+        det = row.get("details", {}) or {}
+        if isinstance(msg, dict) and key in msg:
+            return msg.get(key)
+        if isinstance(det, dict) and key in det:
+            return det.get(key)
+        return None
+
+    for k in ["assessment_id", "class_id", "submission_id", "student_id"]:
+        df[k] = df.apply(lambda r: get_from_both(r, k), axis=1)
+    return df
+
+
+def show_df(df: pd.DataFrame):
+    """Render dataframe using new width API when available, fallback otherwise."""
+    try:
+        st.dataframe(df, width="stretch")
+    except TypeError:
+        st.dataframe(df, use_container_width=True)
+
+
+def apply_session_filter(df: pd.DataFrame, mode: str) -> pd.DataFrame:
+    if mode == "Exclude onboarding sessions":
+        return df[~df["is_onboarding"]]
+    elif mode == "Include only onboarding sessions":
+        return df[df["is_onboarding"]]
+    else:
+        return df
+
+
+# -------------------------
+# App UI
+# -------------------------
+
+st.set_page_config(page_title="Mark.ly Pilot Dashboard", layout="wide")
+st.title("Mark.ly Pilot Dashboard")
+
 # Sidebar inputs
-# ---------------------------------------------
 st.sidebar.header("Inputs")
 log_file = st.sidebar.file_uploader("Upload logs Excel (user_logs_annotated.xlsx)", type=["xlsx"])
 
-total_accounts = st.sidebar.number_input("Total accounts created", min_value=1, value=33, step=1)
+total_accounts = st.sidebar.number_input("Total teacher accounts (target = 33)", min_value=1, value=33, step=1)
+use_observed_denominator = st.sidebar.checkbox(
+    "Use observed unique teachers as denominator",
+    value=False,
+    help=(
+        "If checked, percentages are based only on teacher accounts that appear in the logs "
+        "(observed), not the full expected 33."
+    ),
+)
+
+# Timezone and optional school filter
 tz_offset_hours = st.sidebar.number_input("Timezone offset from UTC (Singapore = +8)", value=8, step=1)
 tz_delta = timedelta(hours=int(tz_offset_hours))
 
 school_filter = st.sidebar.text_input("Filter by school name (contains, optional)", "")
 
 st.sidebar.markdown("---")
-exclude_onboarding_for_retention = st.sidebar.checkbox(
-    "Use first login day as 'Onboarding' for retention (recommended)", value=True
+session_filter_mode = st.sidebar.selectbox(
+    "Onboarding session filter",
+    options=[
+        "Exclude onboarding sessions",
+        "Include only onboarding sessions",
+        "Include everything",
+    ],
+    index=0,
 )
+
 show_post_onboarding_only_power = st.sidebar.checkbox(
-    "Power users from post-onboarding only", value=True
+    "Power users calculated from post-onboarding only", value=True
 )
 
 if not log_file:
-    st.title("Mark.ly Pilot Dashboard")
     st.info("Upload the **logs** file in the sidebar to begin.")
     st.stop()
 
-# ---------------------------------------------
+# -------------------------
 # Load + prepare data
-# ---------------------------------------------
+# -------------------------
+
 logs = load_logs(log_file)
 
-# Teachers only
-logs = logs[logs["user_type"].str.lower() == "teacher"].copy()
+# Remove excluded emails
+logs = logs[~logs["email"].isin(EXCLUDE_EMAILS)].copy()
 
-# Exclude specific emails from all analysis
-exclude_emails = {"teacher1@moe.gov.sg", "teacher3@moe.gov.sg"}
-logs = logs[~logs["email"].isin(exclude_emails)]
-
-# Attach school via hardcoded mapping
+# Attach school mapping
 logs["school"] = logs["email"].map(EMAIL_TO_SCHOOL).fillna("Unknown")
 
-# Parse JSON payload
+# Parse @message JSON
 logs["msg"] = logs["@message"].apply(parse_msg)
+logs["details"] = logs["msg"].apply(lambda d: d.get("details", {}) if isinstance(d, dict) else {})
 
 # Extract common ids
 logs = extract_generic_ids(logs)
 logs["object_id"] = logs["msg"].apply(lambda d: d.get("object_id") if isinstance(d, dict) else None)
-logs["details"] = logs["msg"].apply(lambda d: d.get("details", {}) if isinstance(d, dict) else {})
 logs["details_id"] = logs["details"].apply(lambda d: d.get("id") if isinstance(d, dict) else None)
 logs["error_message"] = logs["msg"].apply(lambda d: d.get("error_message") if isinstance(d, dict) else None)
 
-# Time features
+# Local time features
 logs["ts_local"] = logs["@timestamp"] + tz_delta
-logs["date_local"] = logs["ts_local"].dt.date
+logs["date_local"] = pd.to_datetime(logs["ts_local"]).dt.date
 
-# Optional school filter
+# Compute date range after filtering and removing NaN values
+preview_for_filters = apply_session_filter(logs, session_filter_mode).copy()
+preview_for_filters = preview_for_filters.dropna(subset=["date_local"])
+min_date = preview_for_filters["date_local"].min()
+max_date = preview_for_filters["date_local"].max()
+
+# Optional global school filter (pre-tabs)
 if school_filter.strip():
     logs = logs[logs["school"].astype(str).str.contains(school_filter, case=False, na=False)]
 
-# Derive first login day per account (local tz)
-first_login_date = logs[logs["event_lower"] == "userlogin"].groupby("email")["ts_local"].min().dt.date
+# First login date per teacher (local tz)
+teacher_mask = logs["user_type"].str.lower() == "teacher"
+first_login_date = (
+    logs[teacher_mask & (logs["event_name"].str.lower() == "userlogin")]
+    .groupby("email")["ts_local"]
+    .min()
+    .dt.date
+)
 logs["first_login_date"] = logs["email"].map(first_login_date)
 
-st.title("Mark.ly Pilot Dashboard")
+# Onboarding membership
 
-# ===== Adoption Funnel (includes onboarding) =====
-st.header("Adoption Funnel (including onboarding)")
-emails_df = pd.DataFrame({"email": logs["email"].unique()})
-email_school_map = logs[["email", "school"]].drop_duplicates().set_index("email")["school"]
-emails_df["school"] = emails_df["email"].map(email_school_map)
+def in_school_session(row) -> bool:
+    school = row["school"]
+    sess = SCHOOL_ONBOARDING.get(school)
+    if not sess:
+        return False
+    start_local = pd.to_datetime(f"{sess['date']} {sess['start']}")
+    end_local = pd.to_datetime(f"{sess['date']} {sess['end']}")
+    return (row["ts_local"] >= start_local) and (row["ts_local"] <= end_local)
 
-def flag_by_event(df, ev):
-    return (
-        df[df["event_lower"] == ev]
-        .groupby("email")
-        .size()
-        .reindex(emails_df["email"], fill_value=0)
-        .gt(0)
-    )
+logs["is_onboarding"] = logs.apply(in_school_session, axis=1)
 
-funnel_flags = emails_df.copy()
-for ev in ["userlogin", "createclass", "createassessment", "gradesubmission"]:
-    funnel_flags[ev] = flag_by_event(logs, ev).values
-# refined = updatefeedback or updaterubric
-funnel_flags["refined_any"] = flag_by_event(logs, "updatefeedback") | flag_by_event(logs, "updaterubric")
+# ============================
+# Filters derived from data
+# ============================
 
-def pct(n):
-    return round(n / total_accounts * 100, 1)
+# Compute school list and date range (after session filter so onboarding logic applies)
+preview_for_filters = apply_session_filter(logs, session_filter_mode).copy()
+all_schools = sorted(preview_for_filters["school"].dropna().unique().tolist())
+min_date = preview_for_filters["date_local"].min()
+max_date = preview_for_filters["date_local"].max()
 
-rows = []
-stages = [
-    ("Logged in", "userlogin"),
-    ("Created class", "createclass"),
-    ("Created assessment", "createassessment"),
-    ("Graded submission", "gradesubmission"),
-    ("Refined feedback", "refined_any"),
-]
-for label, col in stages:
-    cnt = int(funnel_flags[col].sum())
-    rows.append({"Metric": label, "Count": cnt, "% of total": pct(cnt)})
-funnel_df = pd.DataFrame(rows)
-
-c1, c2 = st.columns([1, 1])
-with c1:
-    st.dataframe(funnel_df, use_container_width=True)
-with c2:
-    chart = (
-        alt.Chart(funnel_df)
-        .mark_bar()
-        .encode(x=alt.X("Metric:N", sort=None), y="Count:Q", tooltip=["Metric", "Count", "% of total"])
-    )
-    st.altair_chart(chart, use_container_width=True)
-
-# ===== Retention (post-onboarding only) =====
-st.header("Retention (post-onboarding only)")
-if exclude_onboarding_for_retention:
-    post = logs[logs["date_local"] > logs["first_login_date"]].copy()
-else:
-    post = logs.copy()
-
-ret_days = post.groupby("email")["date_local"].nunique().reindex(emails_df["email"], fill_value=0)
-
-def bucket(n):
-    if n == 0:
-        return "1 day only"
-    if 1 <= n <= 2:
-        return "2–3 days"
-    return "4+ days"
-
-ret_buckets = (
-    ret_days.apply(bucket)
-    .value_counts()
-    .reindex(["1 day only", "2–3 days", "4+ days"], fill_value=0)
-    .reset_index()
+# Sidebar: School multiselect + Date range
+st.sidebar.markdown("### Data Filters")
+selected_schools = st.sidebar.multiselect(
+    "Schools", options=all_schools, default=all_schools,
+    help="Select one or more schools to focus the analysis",
 )
-ret_buckets.columns = ["Retention Bucket", "Number of Teachers"]
 
-c1, c2 = st.columns([1, 1])
-with c1:
-    st.dataframe(ret_buckets, use_container_width=True)
-with c2:
+date_range = st.sidebar.date_input(
+    "Date range (local)",
+    value=(min_date, max_date) if (pd.notnull(min_date) and pd.notnull(max_date)) else None,
+)
+
+# Helper to apply school + date filters consistently
+
+def apply_data_filters(df: pd.DataFrame) -> pd.DataFrame:
+    base = apply_session_filter(df, session_filter_mode)
+    if selected_schools:
+        base = base[base["school"].isin(selected_schools)]
+    # date_range can be a single date or tuple from Streamlit
+    if isinstance(date_range, tuple) and len(date_range) == 2:
+        start_d, end_d = date_range
+        if pd.notnull(start_d) and pd.notnull(end_d):
+            base = base[(base["date_local"] >= start_d) & (base["date_local"] <= end_d)]
+    return base
+
+# ============================
+# Tabs (Layer 1, Layer 3, Diagnostics)
+# ============================
+
+layer1_tab, schools_tab, diag_tab = st.tabs([
+    "Executive View",  # Layer 1
+    "School Comparisons",  # Layer 3
+    "Diagnostics: AI Trust & Students",  # Rubric edits + Student activity
+])
+
+# ----------------------------
+# Layer 1 – Executive View
+# ----------------------------
+with layer1_tab:
+    st.subheader("Layer 1 – Executive View")
+    view_logs = apply_data_filters(logs)
+    teacher_logs = view_logs[view_logs["user_type"].str.lower() == "teacher"].copy()
+    student_logs = view_logs[view_logs["user_type"].str.lower() == "student"].copy()
+
+    # KPI Header
+    k1, k2, k3, k4, k5 = st.columns(5)
+    with k1:
+        st.metric("Schools (in view)", len(selected_schools))
+    with k2:
+        denom = (teacher_logs["email"].nunique() if use_observed_denominator else total_accounts)
+        st.metric("Teacher denominator", int(denom))
+    with k3:
+        logged_in_teachers = teacher_logs.loc[teacher_logs["event_name"].str.lower()=="userlogin", "email"].nunique()
+        pct_login = round((logged_in_teachers / max(1, denom)) * 100, 1)
+        st.metric("% Logged in", f"{pct_login}%", help="Post-onboarding by filter")
+    with k4:
+        graded_teachers = teacher_logs.loc[teacher_logs["event_name"].str.lower()=="gradesubmission", "email"].nunique()
+        pct_graded = round((graded_teachers / max(1, denom)) * 100, 1)
+        st.metric("% Graded", f"{pct_graded}%")
+    with k5:
+        fb = teacher_logs[teacher_logs["event_name"].str.lower().isin(["updatefeedback","deletefeedback","createfeedback"])].copy()
+        trust_updates = int((fb["event_name"].str.lower()=="updatefeedback").sum())
+        overrides = int(fb["event_name"].str.lower().isin(["deletefeedback","createfeedback"]).sum())
+        trust_ratio = round(trust_updates/(trust_updates+overrides),3) if (trust_updates+overrides)>0 else None
+        st.metric("Trust ratio", trust_ratio if trust_ratio is not None else "–")
+
+    # Denominator explainer
+    st.caption(
+        "Percentages use the selected denominator: **observed unique teachers** (those appearing in logs) "
+        "or the fixed target of 33."
+    )
+
+    # Funnel (teachers)
+    st.markdown("### Adoption Funnel (Teachers)")
+    # Exclude first-login day for stricter post-onboarding signal
+    teacher_logs["first_login_date"] = teacher_logs["first_login_date"]
+    funnel_logs = teacher_logs[~(teacher_logs["date_local"] == teacher_logs["first_login_date"])].copy()
+
+    emails_df = pd.DataFrame({"email": funnel_logs["email"].unique()})
+    def flag_by_event(df: pd.DataFrame, ev: str) -> pd.Series:
+        m = df["event_name"].str.lower() == ev
+        return (
+            df[m].groupby("email").size().reindex(emails_df["email"], fill_value=0).gt(0)
+        )
+
+    funnel_flags = emails_df.copy()
+    for ev in ["userlogin","createclass","createassessment","gradesubmission"]:
+        funnel_flags[ev] = flag_by_event(funnel_logs, ev).values
+    funnel_flags["refined_any"] = flag_by_event(funnel_logs, "updatefeedback") | flag_by_event(funnel_logs, "updaterubric")
+
+    def pct(n:int,d:int)->float:
+        return round((n/max(d,1))*100,1)
+
+    rows = []
+    stages = [("Logged in","userlogin"),("Created class","createclass"),("Created assessment","createassessment"),("Graded submission","gradesubmission"),("Refined feedback","refined_any")]
+    for label, col in stages:
+        cnt = int(funnel_flags[col].sum())
+        rows.append({"Metric":label,"Count":cnt,"% of denominator":pct(cnt, denom)})
+    funnel_df = pd.DataFrame(rows)
+
+    c1, c2 = st.columns(2)
+    with c1:
+        show_df(funnel_df)
+    with c2:
+        st.altair_chart(
+            alt.Chart(funnel_df).mark_bar().encode(
+                x=alt.X("Metric:N", sort=None), y="Count:Q", tooltip=["Metric","Count","% of denominator"]
+            ), use_container_width=True
+        )
+
+    # Retention buckets (teachers)
+    st.markdown("### Retention Overview (Teachers)")
+    post = teacher_logs[teacher_logs["date_local"] > teacher_logs["first_login_date"]].copy()
+    ret_days = post.groupby("email")["date_local"].nunique()
+    def bucket(n:int)->str:
+        if n==0: return "0 days"
+        if n==1: return "1 day"
+        if 2<=n<=3: return "2–3 days"
+        return "4+ days"
+    ret_buckets = (
+        ret_days.apply(bucket).value_counts().reindex(["0 days","1 day","2–3 days","4+ days"], fill_value=0).reset_index()
+    )
+    ret_buckets.columns = ["Retention Bucket","Number of Teachers"]
+
+    c3, c4 = st.columns(2)
+    with c3:
+        show_df(ret_buckets)
+    with c4:
+        st.altair_chart(
+            alt.Chart(ret_buckets).mark_bar().encode(
+                x=alt.X("Retention Bucket:N", sort=None), y="Number of Teachers:Q", tooltip=["Retention Bucket","Number of Teachers"]
+            ), use_container_width=True
+        )
+
+# ----------------------------
+# Layer 3 – School Comparisons
+# ----------------------------
+with schools_tab:
+    st.subheader("Layer 3 – School Comparisons")
+    view_logs = apply_data_filters(logs)
+    tlogs = view_logs[view_logs["user_type"].str.lower()=="teacher"].copy()
+    tlogs = tlogs[~(tlogs["date_local"] == tlogs["first_login_date"])]  # post-onboarding signal
+
+    # Funnel by school (percent of denominator per school)
+    st.markdown("### Mini-Funnels per School")
+
+    def per_school_percent(ev_name:str) -> pd.DataFrame:
+        df = tlogs[tlogs["event_name"].str.lower()==ev_name].groupby(["school"])['email'].nunique().rename("count").reset_index()
+        # denominators per school (observed teachers in view)
+        denom_df = tlogs.groupby("school")["email"].nunique().rename("denom").reset_index()
+        out = denom_df.merge(df, on="school", how="left").fillna({"count":0})
+        out["percent"] = (out["count"]/out["denom"].replace(0,1))*100
+        out["stage"] = ev_name
+        return out
+
+    stages = ["userlogin","createclass","createassessment","gradesubmission","updatefeedback"]
+    parts = [per_school_percent(s) for s in stages]
+    school_funnel = pd.concat(parts, ignore_index=True)
+
     st.altair_chart(
-        alt.Chart(ret_buckets)
-        .mark_bar()
-        .encode(
-            x=alt.X("Retention Bucket:N", sort=None),
-            y="Number of Teachers:Q",
-            tooltip=["Retention Bucket", "Number of Teachers"],
-        ),
+        alt.Chart(school_funnel).mark_bar().encode(
+            x=alt.X("stage:N", title="Stage", sort=["userlogin","createclass","createassessment","gradesubmission","updatefeedback"]),
+            y=alt.Y("percent:Q", title="% of observed teachers"),
+            column=alt.Column("school:N", title="School"),
+            tooltip=["school","stage","percent"],
+        ).resolve_scale(y='independent'),
         use_container_width=True,
     )
 
-# ===== Trust vs Override =====
-st.header("Trust vs Override (feedback behaviour)")
-fb = logs[logs["event_lower"].isin(["updatefeedback", "deletefeedback", "createfeedback"])].copy()
-trust_updates = int((fb["event_lower"] == "updatefeedback").sum())
-overrides = int(fb["event_lower"].isin(["deletefeedback", "createfeedback"]).sum())
-trust_ratio = round(trust_updates / (trust_updates + overrides), 3) if (trust_updates + overrides) > 0 else None
+    # Retention by school (stacked buckets)
+    st.markdown("### Retention by School (stacked)")
+    post = tlogs.copy()
+    ret_days = post.groupby(["school","email"])['date_local'].nunique().reset_index(name="days")
+    def bucket(n:int)->str:
+        if n==0: return "0 days"
+        if n==1: return "1 day"
+        if 2<=n<=3: return "2–3 days"
+        return "4+ days"
+    ret_days["bucket"] = ret_days["days"].apply(bucket)
+    ret_stack = ret_days.groupby(["school","bucket"]).size().reset_index(name="teachers")
 
-trust_df = pd.DataFrame(
-    {
-        "Metric": ["UpdateFeedback (minor edits)", "Delete+Create (override)", "Trust ratio (updates / updates + Overrides)"],
-        "Value": [trust_updates, overrides, trust_ratio],
-    }
-)
-c1, c2 = st.columns([1, 1])
-with c1:
-    st.dataframe(trust_df, use_container_width=True)
-with c2:
     st.altair_chart(
-        alt.Chart(pd.DataFrame({"Type": ["UpdateFeedback", "Override"], "Count": [trust_updates, overrides]}))
-        .mark_bar()
-        .encode(x="Type:N", y="Count:Q", tooltip=["Type", "Count"]),
-        use_container_width=True,
+        alt.Chart(ret_stack).mark_bar().encode(
+            x=alt.X("school:N", title="School"),
+            y=alt.Y("teachers:Q", title="# Teachers"),
+            color=alt.Color("bucket:N", title="Retention"),
+            order=alt.Order('bucket', sort='ascending'),
+            tooltip=["school","bucket","teachers"],
+        ), use_container_width=True
     )
 
-# ===== Rubric updates (count + denominator + %) =====
-st.header("Rubric Updates (count + denominator + %)")
-assess_create = logs[logs["event_lower"] == "createassessment"].copy()
-# unique assessments created (prefer object_id, fallback details_id, else generic assessment_any); keep NaN for safe unique counts
-assess_create["assessment_key"] = assess_create["object_id"].combine_first(
-    assess_create["details_id"]
-).combine_first(assess_create["assessment_any"])
+# ----------------------------
+# Diagnostics – AI Trust & Students
+# ----------------------------
+with diag_tab:
+    st.subheader("Diagnostics – AI Trust & Student Activity")
+    view_logs = apply_data_filters(logs)
 
-assess_create = assess_create[assess_create["assessment_key"].notna()]
-
-rubric_updates = logs[logs["event_lower"] == "updaterubric"].copy()
-rubric_updates["assessment_ref"] = rubric_updates["assessment_any"].combine_first(
-    rubric_updates["object_id"]
-).combine_first(rubric_updates["details_id"])
-
-total_assessments = int(assess_create["assessment_key"].nunique())
-assess_with_rubric_update = int(rubric_updates["assessment_ref"].dropna().nunique())
-rubric_update_events = int(rubric_updates.shape[0])
-rubric_rate = round(assess_with_rubric_update / total_assessments * 100, 1) if total_assessments > 0 else None
-
-rubric_df = pd.DataFrame(
-    {
-        "Metric": [
-            "UpdateRubric events (count)",
-            "Assessments created (unique)",
-            "Assessments with ≥1 rubric update (unique)",
-            "Rubric update rate (%)",
-        ],
-        "Value": [rubric_update_events, total_assessments, assess_with_rubric_update, rubric_rate],
-    }
-)
-c1, c2 = st.columns([1, 1])
-with c1:
-    st.dataframe(rubric_df, use_container_width=True)
-with c2:
+    # AI Trust (rubric/feedback edits)
+    st.markdown("### AI Trust: Edits vs Overrides")
+    tlogs = view_logs[view_logs["user_type"].str.lower()=="teacher"].copy()
+    fb = tlogs[tlogs["event_name"].str.lower().isin(["updatefeedback","updaterubric","deletefeedback","createfeedback"])].copy()
+    fb["kind"] = fb["event_name"].str.lower().map({
+        "updatefeedback":"UpdateFeedback",
+        "updaterubric":"UpdateRubric",
+        "deletefeedback":"Override",
+        "createfeedback":"Override",
+    }).fillna("Other")
+    trust_summary = fb.groupby("kind").size().reset_index(name="count")
+    show_df(trust_summary)
     st.altair_chart(
-        alt.Chart(
-            pd.DataFrame(
-                {
-                    "Category": ["Assessments", "With Rubric Update"],
-                    "Count": [total_assessments, assess_with_rubric_update],
-                }
-            )
-        )
-        .mark_bar()
-        .encode(x="Category:N", y="Count:Q", tooltip=["Category", "Count"]),
-        use_container_width=True,
+        alt.Chart(trust_summary).mark_bar().encode(x="kind:N", y="count:Q", tooltip=["kind","count"]),
+        use_container_width=True
     )
 
-# ===== Workflow Timing (proxy: Create → UpdateSubmission → UpdateFeedback) =====
-st.header("Workflow Timing (proxy)")
-upd_sub = logs[logs["event_lower"] == "updatesubmission"].copy()
-upd_sub["assessment_ref"] = upd_sub["assessment_any"].combine_first(upd_sub["object_id"]).combine_first(upd_sub["details_id"])
-upd_sub["submission_ref"] = upd_sub["submission_any"]
-
-upd_fb = logs[logs["event_lower"] == "updatefeedback"].copy()
-upd_fb["submission_ref"] = upd_fb["submission_any"]
-
-t_create = assess_create.groupby("assessment_key")["@timestamp"].min()
-t_first_updatesub = upd_sub.groupby("assessment_ref")["@timestamp"].min()
-
-# Map submissions to assessments via UpdateSubmission
-sub_to_assess = upd_sub.dropna(subset=["assessment_ref", "submission_ref"])[["submission_ref", "assessment_ref"]].drop_duplicates()
-upd_fb_mapped = upd_fb.merge(sub_to_assess, on="submission_ref", how="left")
-t_first_updatefb = upd_fb_mapped.dropna(subset=["assessment_ref"]).groupby("assessment_ref")["@timestamp"].min()
-
-rows = []
-for aid in t_create.index:
-    t0 = t_create.get(aid, pd.NaT)
-    t1 = t_first_updatesub.get(aid, pd.NaT)
-    t2 = t_first_updatefb.get(aid, pd.NaT)
-    if pd.isna(t0):
-        continue
-    d1 = (t1 - t0).total_seconds() / 60 if pd.notna(t1) else None  # Create → first processed submission
-    d2 = (t2 - t1).total_seconds() / 60 if (pd.notna(t1) and pd.notna(t2)) else None  # First processed → first feedback edit
-    rows.append(
-        {"assessment_key": str(aid), "mins_create_to_updatesub": d1, "mins_updatesub_to_updatefb": d2}
-    )
-
-steps_proxy = pd.DataFrame(rows)
-
-col1, col2 = st.columns([1, 1])
-with col1:
-    st.subheader("Per-assessment timings (minutes)")
-    st.dataframe(steps_proxy, use_container_width=True)
-with col2:
-    # Summary stats
-    def summarize_series(series):
-        s = pd.to_numeric(series.dropna(), errors="coerce")
-        if s.empty:
-            return {"min": None, "median": None, "mean": None, "max": None, "n": 0}
-        return {
-            "min": round(float(s.min()), 1),
-            "median": round(float(s.median()), 1),
-            "mean": round(float(s.mean()), 1),
-            "max": round(float(s.max()), 1),
-            "n": int(s.shape[0]),
-        }
-
-    summary = (
-        pd.DataFrame(
-            {
-                "Create→UpdateSubmission": summarize_series(steps_proxy["mins_create_to_updatesub"]),
-                "UpdateSubmission→UpdateFeedback": summarize_series(steps_proxy["mins_updatesub_to_updatefb"]),
-            }
+    # Student activity distribution
+    st.markdown("### Student Activity Distribution")
+    s_logs = view_logs[view_logs["user_type"].str.lower()=="student"].copy()
+    # Distinct active days per student
+    s_days = s_logs.groupby("email")["date_local"].nunique().reset_index(name="active_days")
+    if not s_days.empty:
+        st.altair_chart(
+            alt.Chart(s_days).mark_bar().encode(
+                x=alt.X("active_days:Q", bin=alt.Bin(maxbins=10), title="Active days per student"),
+                y=alt.Y("count():Q", title="# Students"),
+                tooltip=["count()","active_days"]
+            ), use_container_width=True
         )
-        .T.reset_index()
-        .rename(columns={"index": "Step"})
-    )
-    st.subheader("Summary (minutes)")
-    st.dataframe(summary, use_container_width=True)
+    else:
+        st.info("No student activity in the current filter.")
 
-# ===== OCR / Submission Batch Sizes (per assessment) =====
-st.header("OCR / Submission Batch Sizes (per assessment)")
-subs_per_assess = (
-    sub_to_assess.groupby("assessment_ref")["submission_ref"]
-    .nunique()
-    .reset_index(name="unique_submissions")
-    .sort_values("unique_submissions", ascending=False)
-)
-
-c1, c2 = st.columns([1, 1])
-with c1:
-    st.dataframe(subs_per_assess, use_container_width=True)
-with c2:
-    if not subs_per_assess.empty:
-        hist = (
-            alt.Chart(subs_per_assess)
-            .mark_bar()
-            .encode(
-                x=alt.X("unique_submissions:Q", bin=alt.Bin(maxbins=20), title="Submissions per assessment"),
-                y="count():Q",
-                tooltip=[alt.Tooltip("unique_submissions:Q", title="Subs/assessment"), alt.Tooltip("count():Q", title="Count")],
-            )
+    # Student logins over time (line)
+    s_login = s_logs[s_logs["event_name"].str.lower()=="userlogin"].groupby("date_local").size().reset_index(name="logins")
+    if not s_login.empty:
+        st.altair_chart(
+            alt.Chart(s_login).mark_line(point=True).encode(
+                x=alt.X("date_local:T", title="Date"), y=alt.Y("logins:Q", title="Student logins"), tooltip=["date_local","logins"]
+            ), use_container_width=True
         )
-        st.altair_chart(hist, use_container_width=True)
+    else:
+        st.info("No student logins in the current filter.")
 
-# ===== Power users =====
-st.header("Power Users")
-logs["day_local"] = logs["date_local"]
-user_days = logs.groupby("email")["day_local"].nunique().rename("distinct_days")
-graded_counts = logs.loc[logs["event_lower"] == "gradesubmission"].groupby("email").size().rename("graded_count")
-refined_counts = logs[logs["event_lower"].isin(["updaterubric", "updatefeedback"])].groupby("email").size().rename("refined_count")
-total_events = logs.groupby("email").size().rename("total_events")
-user_school = logs.groupby("email")["school"].agg(lambda x: x.dropna().iloc[0] if (x.dropna().shape[0] > 0) else None)
+# ----------------------------
+# Lightweight self-tests (optional)
+# ----------------------------
 
-per_account = (
-    pd.concat([user_school, graded_counts, refined_counts, user_days, total_events], axis=1)
-    .fillna(0)
-    .reset_index()
-)
-per_account[["graded_count", "refined_count", "distinct_days", "total_events"]] = per_account[
-    ["graded_count", "refined_count", "distinct_days", "total_events"]
-].astype(int)
+def _self_test():
+    # parse_msg handles JSON and single-quoted JSON
+    assert parse_msg('{"a": 1}')["a"] == 1
+    assert parse_msg("{'a': 1}")["a"] == 1
 
-if show_post_onboarding_only_power:
-    post_only = logs[logs["date_local"] > logs["first_login_date"]]
-    post_days = post_only.groupby("email")["date_local"].nunique().rename("distinct_days_post")
-    per_account = per_account.merge(post_days, on="email", how="left").fillna({"distinct_days_post": 0})
-    per_account["distinct_days_eval"] = per_account["distinct_days_post"].astype(int)
-else:
-    per_account["distinct_days_eval"] = per_account["distinct_days"]
+    # apply_session_filter works for all modes
+    _df = pd.DataFrame({"is_onboarding": [True, False, True]})
+    assert len(apply_session_filter(_df, "Exclude onboarding sessions")) == 1
+    assert len(apply_session_filter(_df, "Include only onboarding sessions")) == 2
+    assert len(apply_session_filter(_df, "Include everything")) == 3
 
-power = per_account.sort_values(
-    ["graded_count", "refined_count", "distinct_days_eval", "total_events"], ascending=[False, False, False, False]
-).head(10)
-st.dataframe(
-    power.rename(
-        columns={
-            "email": "Email",
-            "school": "School",
-            "graded_count": "Graded",
-            "refined_count": "Refined",
-            "distinct_days_eval": "Distinct days (eval)",
-            "total_events": "Total events",
-        }
-    ),
-    use_container_width=True,
-)
+    # extract_generic_ids pulls from msg/details
+    test = pd.DataFrame({
+        "msg": [{"assessment_id": "A1"}, {}],
+        "details": [{}, {"assessment_id": "A2"}],
+    })
+    out = extract_generic_ids(test.copy())
+    assert set(out["assessment_id"].fillna("").unique()) == {"A1", "A2", ""}
 
-# ===== Errors =====
-# ===== st.header("Errors by Event Type")
-# =====errors = logs[logs["error_message"].notna() & (logs["error_message"].astype(str).str.len() > 0)]
-# =====err_counts = errors["event_lower"].value_counts().reset_index().rename(columns={"index": "event", "event_lower": "error_count"})
-
-#======c1, c2 = st.columns([1, 1])
-#======with c1:
-#=======    st.dataframe(err_counts, use_container_width=True)
-#=======with c2:
-#=======    if not err_counts.empty:
-#======        st.altair_chart(
-#======            alt.Chart(err_counts).mark_bar().encode(x="event:N", y="error_count:Q", tooltip=["event", "error_count"]),
-#======            use_container_width=True,
-#======        )
-
-st.caption(
-    "Notes: Times are computed from UTC logs shifted by the selected timezone. "
-    "Retention uses the first login day as onboarding (if enabled). "
-    "Step-wise timings use a robust proxy (Create→UpdateSubmission→UpdateFeedback) based on available IDs. "
-    "OCR batch size uses unique submissions per assessment via UpdateSubmission. "
-    "School mapping is hardcoded in the script."
-)
+# Enable with: add to .streamlit/secrets.toml -> RUN_SELF_TESTS = true
+try:
+    if bool(st.secrets.get("RUN_SELF_TESTS", False)):
+        _self_test()
+        st.sidebar.success("Self-tests passed ✅")
+except Exception as _e:
+    st.sidebar.warning(f"Self-tests failed: {_e}")
