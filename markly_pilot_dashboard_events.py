@@ -37,7 +37,7 @@ def try_parse_message_payload(s):
         return {}
 
 def normalise_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Rename common variants to canonical names."""
+    # Rename common variants
     colmap = {}
     for c in df.columns:
         cl = c.strip().lower()
@@ -62,24 +62,18 @@ def get_filter_inputs(df: pd.DataFrame):
         else:
             sel_types = None
 
-        # School (robust empty handling)
+        # School filter (if present)
         if "School" in df.columns:
-            schools_series = df["School"].dropna().astype(str).str.strip()
-            schools = sorted(s for s in schools_series.unique().tolist() if s)
-            if not schools:
-                st.info(
-                    "No School values found. This usually means the uploaded file lacks a 'School' column, "
-                    "the email→school mapping didn’t match any rows, or values are blank."
-                )
-                sel_schools = []
-            else:
-                sel_schools = st.multiselect("School", schools, default=schools, key="flt_schools")
-        else:
-            sel_schools = None
+            schools = sorted([s for s in df["School"].dropna().unique().tolist()])
+            sel_schools = st.multiselect("School", schools, default=schools if schools else [])
+            if sel_schools:
+                df = df[df["School"].isin(sel_schools)]
 
-        # Teacher
-        emails = sorted(df["email"].dropna().astype(str).unique().tolist())
-        sel_emails = st.multiselect("Teacher (email)", emails, default=[], key="flt_emails")
+        # Teacher filter
+        emails = sorted(df["email"].dropna().unique().tolist())
+        sel_emails = st.multiselect("Teacher (email)", emails, default=[])
+        if sel_emails:
+            df = df[df["email"].isin(sel_emails)]
 
         # Events
         present_events = sorted(df["event_name"].dropna().unique().tolist())
@@ -139,10 +133,7 @@ def apply_selected_filters(df: pd.DataFrame, sel: dict) -> pd.DataFrame:
 # -------------------------------------------------------------------------------
 
 if uploaded is None:
-    st.info(
-        "Upload an event-level Excel file to begin. Expected columns: '@timestamp', 'email', 'event_name'. "
-        "Optional: 'user_type', 'School'. If '@message' contains JSON, the app will try to backfill fields."
-    )
+    st.info("Upload an event-level Excel file to begin. Expected columns include '@timestamp', 'email', 'event_name'. Optional: 'user_type' (filter to teachers), 'School'. If '@message' contains JSON, the app will try to backfill missing fields.")
 else:
     # --- Load file ---
     try:
@@ -244,15 +235,8 @@ else:
     df = df.dropna(subset=["@timestamp"])
     df["date"] = df["@timestamp"].dt.date
 
-    # Sidebar filters (after mapping): collect, then apply on click
-    selections = get_filter_inputs(df)
-    df_filtered = apply_selected_filters(df, selections)
-
-    if not selections.get("apply", False):
-        st.warning("Adjust filters in the sidebar and click **Apply filters** to update the dashboard.")
-        working_df = df   # show overall until applied
-    else:
-        working_df = df_filtered
+    # Apply filters in sidebar
+    df = apply_sidebar_filters(df)
 
     if working_df.empty:
         st.warning("No data after applied filters. Adjust filters on the left and click **Apply filters**.")
@@ -266,11 +250,6 @@ else:
     active_teachers = int((events_by_teacher > 0).sum())
     median_events = int(events_by_teacher.median()) if not events_by_teacher.empty else 0
     mean_events = float(events_by_teacher.mean()) if not events_by_teacher.empty else 0.0
-
-    # Unique active days
-    days_per_teacher = working_df.groupby("email")["date"].nunique()
-    repeat_count = int(days_per_teacher.ge(2).sum())
-    pct_repeat = (repeat_count / total_teachers * 100.0) if total_teachers else 0.0
 
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Total Events", total_events)
@@ -298,6 +277,26 @@ else:
             title="Distribution of Unique Active Days"
         )
         st.plotly_chart(fig, use_container_width=True)
+
+    # Export: Summary table
+    summary_df = pd.DataFrame({
+        "Metric": [
+            "Total Events", "Total Teachers", "Active Teachers",
+            "Avg Events per Teacher", "Median Events per Teacher",
+            "Teachers with ≥2 Active Days", "% Teachers with ≥2 Active Days"
+        ],
+        "Value": [
+            total_events, total_teachers, active_teachers,
+            round(mean_events, 1), median_events,
+            repeat_count, round(pct_repeat, 1)
+        ]
+    })
+    st.download_button(
+        "⬇️ Download Summary (CSV)",
+        data=summary_df.to_csv(index=False).encode("utf-8"),
+        file_name="summary.csv",
+        mime="text/csv",
+    )
 
     # Export: Summary table
     summary_df = pd.DataFrame({
@@ -351,16 +350,9 @@ else:
 
     # ========= Feature validation =========
     st.subheader("Feature Validation")
-    if "School" in working_df.columns and working_df["School"].notna().any():
-        heat = working_df.groupby(["School", "event_name"]).size().unstack(fill_value=0)
-        st.dataframe(heat, width="stretch")
-
-        st.download_button(
-            "⬇️ Download Feature Validation (CSV)",
-            data=heat.to_csv().encode("utf-8"),
-            file_name="feature_validation_by_school.csv",
-            mime="text/csv",
-        )
+    if "School" in df.columns and df["School"].notna().any():
+        heat = df.groupby(["School", "event_name"]).size().unstack(fill_value=0)
+        st.dataframe(heat, use_container_width=True)
 
         st.markdown("**Stacked Events per School**")
         fig3 = plt.figure(figsize=(10,5))
@@ -376,15 +368,8 @@ else:
         plt.legend(bbox_to_anchor=(1.02, 1), loc="upper left", frameon=False)
         st.pyplot(fig3)
     else:
-        counts = working_df["event_name"].value_counts().sort_values(ascending=False)
-        st.dataframe(counts.to_frame("Event Count"), width="stretch")
-
-        st.download_button(
-            "⬇️ Download Event Counts (CSV)",
-            data=counts.to_csv().encode("utf-8"),
-            file_name="event_counts_overall.csv",
-            mime="text/csv",
-        )
+        counts = df["event_name"].value_counts().sort_values(ascending=False)
+        st.dataframe(counts.to_frame("Event Count"))
 
         fig4 = plt.figure(figsize=(8,5))
         plt.bar(counts.index, counts.values)
@@ -409,14 +394,7 @@ else:
         school_map = working_df[["email","School"]].dropna().drop_duplicates().set_index("email")["School"].to_dict()
         pivot.insert(0, "School", pivot.index.map(lambda e: school_map.get(e, "")))
         pivot = pivot.reset_index().set_index(["School","email"])
-    st.dataframe(pivot, width="stretch")
-
-    st.download_button(
-        "⬇️ Download Teacher Breakdown (CSV)",
-        data=pivot.to_csv().encode("utf-8"),
-        file_name="teacher_breakdown.csv",
-        mime="text/csv",
-    )
+    st.dataframe(pivot, use_container_width=True)
 
     st.divider()
 
@@ -425,10 +403,9 @@ else:
     cA, cB = st.columns(2)
     with cA:
         st.markdown("**Events per Day (Filtered Data)**")
-        daily = working_df.groupby("date").size().rename("events")
-        x_dates = pd.to_datetime(daily.index)  # safe datetime conversion for plotting
+        daily = df.groupby("date").size()
         fig5 = plt.figure(figsize=(6,4))
-        plt.plot(x_dates, daily.values)
+        plt.plot(daily.index.astype("datetime64[D]"), daily.values)
         plt.xlabel("Date")
         plt.ylabel("Events")
         plt.title("Daily Event Volume")
@@ -454,4 +431,4 @@ else:
             mime="text/csv",
         )
 
-    st.success("Dashboard ready. Use the left filters, click **Apply filters**, then export the exact slice you need.")
+    st.success("Dashboard ready. Use the left filters to slice by school, teacher, and event types.")
