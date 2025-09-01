@@ -198,7 +198,6 @@ if not log_file:
 # Load + prepare data
 # -------------------------
 
-# After loading logs but before any filtering
 logs = load_logs(log_file)
 
 # Remove excluded emails
@@ -207,45 +206,7 @@ logs = logs[~logs["email"].isin(EXCLUDE_EMAILS)].copy()
 # Attach school mapping
 logs["school"] = logs["email"].map(EMAIL_TO_SCHOOL).fillna("Unknown")
 
-# Create local time features FIRST
-logs["@timestamp"] = pd.to_datetime(logs["@timestamp"], errors="coerce", utc=True)
-logs["ts_local"] = logs["@timestamp"].dt.tz_convert('Asia/Singapore')
-logs["date_local"] = pd.to_datetime(logs["ts_local"].dt.date)  # Convert to datetime, not date
-
-# Then add onboarding detection
-SCHOOL_ONBOARDING = {
-    "ACSI": {"date": "2025-08-12", "start": "14:30", "end": "15:30"},
-    "Anglican": {"date": "2025-08-12", "start": "16:00", "end": "17:00"},
-    "Ngee Ann": {"date": "2025-08-13", "start": "15:30", "end": "16:30"},
-    "Bartley": {"date": "2025-08-13", "start": "15:30", "end": "16:30"},
-    "Northlight": {"date": "2025-08-18", "start": "15:00", "end": "16:00"},
-    "St Andrew": {"date": "2025-08-20", "start": "10:30", "end": "11:30"},
-    "Pei Hwa": {"date": "2025-08-20", "start": "15:30", "end": "16:30"}
-}
-
-def in_school_session(row) -> bool:
-    school = row["school"]
-    sess = SCHOOL_ONBOARDING.get(school)
-    if not sess:
-        return False
-
-    tz = 'Asia/Singapore'
-    start_local = pd.to_datetime(f"{sess['date']} {sess['start']}").tz_localize(tz)
-    end_local = pd.to_datetime(f"{sess['date']} {sess['end']}").tz_localize(tz)
-
-    ts_local = row["ts_local"]
-    # If ts_local is naive, localize to UTC then convert
-    if ts_local.tzinfo is None or ts_local.tz is None:
-        ts_local = pd.Timestamp(ts_local).tz_localize('UTC').tz_convert(tz)
-    else:
-        ts_local = ts_local.tz_convert(tz)
-
-    return (ts_local >= start_local) and (ts_local <= end_local)
-
-# Create is_onboarding column
-logs["is_onboarding"] = logs.apply(in_school_session, axis=1)
-
-# Then continue with rest of processing
+# Parse @message JSON
 logs["msg"] = logs["@message"].apply(parse_msg)
 logs["details"] = logs["msg"].apply(lambda d: d.get("details", {}) if isinstance(d, dict) else {})
 
@@ -255,11 +216,9 @@ logs["object_id"] = logs["msg"].apply(lambda d: d.get("object_id") if isinstance
 logs["details_id"] = logs["details"].apply(lambda d: d.get("id") if isinstance(d, dict) else None)
 logs["error_message"] = logs["msg"].apply(lambda d: d.get("error_message") if isinstance(d, dict) else None)
 
-# Compute date range after filtering and removing NaN values
-preview_for_filters = apply_session_filter(logs, session_filter_mode).copy()
-preview_for_filters = preview_for_filters.dropna(subset=["date_local"])
-min_date = preview_for_filters["date_local"].min()
-max_date = preview_for_filters["date_local"].max()
+# Local time features
+logs["ts_local"] = logs["@timestamp"] + tz_delta
+logs["date_local"] = logs["ts_local"].dt.date
 
 # Optional global school filter (pre-tabs)
 if school_filter.strip():
@@ -271,9 +230,22 @@ first_login_date = (
     logs[teacher_mask & (logs["event_name"].str.lower() == "userlogin")]
     .groupby("email")["ts_local"]
     .min()
-    .dt.normalize()  # Get midnight-anchored datetime
+    .dt.date
 )
 logs["first_login_date"] = logs["email"].map(first_login_date)
+
+# Onboarding membership
+
+def in_school_session(row) -> bool:
+    school = row["school"]
+    sess = SCHOOL_ONBOARDING.get(school)
+    if not sess:
+        return False
+    start_local = pd.to_datetime(f"{sess['date']} {sess['start']}")
+    end_local = pd.to_datetime(f"{sess['date']} {sess['end']}")
+    return (row["ts_local"] >= start_local) and (row["ts_local"] <= end_local)
+
+logs["is_onboarding"] = logs.apply(in_school_session, axis=1)
 
 # ============================
 # Filters derived from data
@@ -282,8 +254,11 @@ logs["first_login_date"] = logs["email"].map(first_login_date)
 # Compute school list and date range (after session filter so onboarding logic applies)
 preview_for_filters = apply_session_filter(logs, session_filter_mode).copy()
 all_schools = sorted(preview_for_filters["school"].dropna().unique().tolist())
-min_date = preview_for_filters["date_local"].min()
-max_date = preview_for_filters["date_local"].max()
+# Robust min/max for mixed-type date columns
+_dl = pd.to_datetime(preview_for_filters["date_local"], errors="coerce")
+_min_ts = _dl.min()
+_max_ts = _dl.max()
+_default_range = None if (pd.isna(_min_ts) or pd.isna(_max_ts)) else (_min_ts.date(), _max_ts.date())
 
 # Sidebar: School multiselect + Date range
 st.sidebar.markdown("### Data Filters")
@@ -292,26 +267,28 @@ selected_schools = st.sidebar.multiselect(
     help="Select one or more schools to focus the analysis",
 )
 
-date_range = st.sidebar.date_input(
-    "Date range (local)",
-    value=(min_date, max_date) if (pd.notnull(min_date) and pd.notnull(max_date)) else None,
-)
+# Streamlit date_input requires a concrete default; fall back to last 30 days if unknown
+try:
+    if _default_range:
+        date_range = st.sidebar.date_input("Date range (local)", value=_default_range)
+    else:
+        _today = pd.Timestamp.utcnow().tz_localize(None).date()
+        date_range = st.sidebar.date_input("Date range (local)", value=(_today - timedelta(days=30), _today))
+except Exception:
+    _today = pd.Timestamp.utcnow().tz_localize(None).date()
+    date_range = st.sidebar.date_input("Date range (local)", value=(_today - timedelta(days=30), _today))
 
 # Helper to apply school + date filters consistently
 
-def apply_data_filters(df: pd.DataFrame) -> pd.DataFrame:
+def apply_data_filters(df: pd.DataFrame, date_range, selected_schools, session_filter_mode: str) -> pd.DataFrame:
     base = apply_session_filter(df, session_filter_mode)
     if selected_schools:
         base = base[base["school"].isin(selected_schools)]
     # date_range can be a single date or tuple from Streamlit
     if isinstance(date_range, tuple) and len(date_range) == 2:
         start_d, end_d = date_range
-        # Ensure both are datetime.date for comparison
         if pd.notnull(start_d) and pd.notnull(end_d):
-            base = base[
-                (pd.to_datetime(base["date_local"]) >= pd.to_datetime(start_d)) &
-                (pd.to_datetime(base["date_local"]) <= pd.to_datetime(end_d))
-            ]
+            base = base[(base["date_local"] >= start_d) & (base["date_local"] <= end_d)]
     return base
 
 # ============================
@@ -329,14 +306,14 @@ layer1_tab, schools_tab, diag_tab = st.tabs([
 # ----------------------------
 with layer1_tab:
     st.subheader("Layer 1 – Executive View")
-    view_logs = apply_data_filters(logs)
+    view_logs = apply_data_filters(logs, date_range, selected_schools, session_filter_mode)
     teacher_logs = view_logs[view_logs["user_type"].str.lower() == "teacher"].copy()
     student_logs = view_logs[view_logs["user_type"].str.lower() == "student"].copy()
 
     # KPI Header
     k1, k2, k3, k4, k5 = st.columns(5)
     with k1:
-        st.metric("Schools (in view)", len(selected_schools))
+        st.metric("Schools (in view)", int(view_logs["school"].nunique()))
     with k2:
         denom = (teacher_logs["email"].nunique() if use_observed_denominator else total_accounts)
         st.metric("Teacher denominator", int(denom))
@@ -364,7 +341,6 @@ with layer1_tab:
     # Funnel (teachers)
     st.markdown("### Adoption Funnel (Teachers)")
     # Exclude first-login day for stricter post-onboarding signal
-    teacher_logs["first_login_date"] = teacher_logs["first_login_date"]
     funnel_logs = teacher_logs[~(teacher_logs["date_local"] == teacher_logs["first_login_date"])].copy()
 
     emails_df = pd.DataFrame({"email": funnel_logs["email"].unique()})
@@ -393,30 +369,18 @@ with layer1_tab:
     with c1:
         show_df(funnel_df)
     with c2:
-        st.altair_chart(
-            alt.Chart(funnel_df).mark_bar().encode(
-                x=alt.X("Metric:N", sort=None), y="Count:Q", tooltip=["Metric","Count","% of denominator"]
-            ), use_container_width=True
-        )
+        if not funnel_df.empty:
+            st.altair_chart(
+                alt.Chart(funnel_df).mark_bar().encode(
+                    x=alt.X("Metric:N", sort=None), y="Count:Q", tooltip=["Metric","Count","% of denominator"]
+                ), use_container_width=True
+            )
+        else:
+            st.info("No teacher funnel data in the current filters.")
 
     # Retention buckets (teachers)
     st.markdown("### Retention Overview (Teachers)")
     post = teacher_logs[teacher_logs["date_local"] > teacher_logs["first_login_date"]].copy()
-
-    # Add debug info right before the post-onboarding filter (around line 404)
-    st.write("Debug date types:")
-    st.write("date_local dtype:", teacher_logs["date_local"].dtype)
-    st.write("first_login_date dtype:", teacher_logs["first_login_date"].dtype)
-    st.write("\nFirst few rows of date_local:")
-    st.write(teacher_logs["date_local"].head())
-    st.write("\nFirst few rows of first_login_date:")
-    st.write(teacher_logs["first_login_date"].head())
-
-    # Original line that's causing the error
-    post = teacher_logs[
-        teacher_logs["date_local"].dt.tz_localize(None) > 
-        teacher_logs["first_login_date"].dt.tz_localize(None)
-    ].copy()
     ret_days = post.groupby("email")["date_local"].nunique()
     def bucket(n:int)->str:
         if n==0: return "0 days"
@@ -432,18 +396,21 @@ with layer1_tab:
     with c3:
         show_df(ret_buckets)
     with c4:
-        st.altair_chart(
-            alt.Chart(ret_buckets).mark_bar().encode(
-                x=alt.X("Retention Bucket:N", sort=None), y="Number of Teachers:Q", tooltip=["Retention Bucket","Number of Teachers"]
-            ), use_container_width=True
-        )
+        if not ret_buckets.empty:
+            st.altair_chart(
+                alt.Chart(ret_buckets).mark_bar().encode(
+                    x=alt.X("Retention Bucket:N", sort=None), y="Number of Teachers:Q", tooltip=["Retention Bucket","Number of Teachers"]
+                ), use_container_width=True
+            )
+        else:
+            st.info("No retention data in the current filters.")
 
 # ----------------------------
 # Layer 3 – School Comparisons
 # ----------------------------
 with schools_tab:
     st.subheader("Layer 3 – School Comparisons")
-    view_logs = apply_data_filters(logs)
+    view_logs = apply_data_filters(logs, date_range, selected_schools, session_filter_mode)
     tlogs = view_logs[view_logs["user_type"].str.lower()=="teacher"].copy()
     tlogs = tlogs[~(tlogs["date_local"] == tlogs["first_login_date"])]  # post-onboarding signal
 
@@ -459,19 +426,22 @@ with schools_tab:
         out["stage"] = ev_name
         return out
 
-    stages = ["userlogin","createclass","createassessment","gradesubmission","updatefeedback"]
+    stages = ["userlogin","createclass","createassessment","gradesubmission","updatefeedback","updaterubric"]
     parts = [per_school_percent(s) for s in stages]
     school_funnel = pd.concat(parts, ignore_index=True)
 
-    st.altair_chart(
-        alt.Chart(school_funnel).mark_bar().encode(
-            x=alt.X("stage:N", title="Stage", sort=["userlogin","createclass","createassessment","gradesubmission","updatefeedback"]),
-            y=alt.Y("percent:Q", title="% of observed teachers"),
-            column=alt.Column("school:N", title="School"),
-            tooltip=["school","stage","percent"],
-        ).resolve_scale(y='independent'),
-        use_container_width=True,
-    )
+    if not school_funnel.empty:
+        st.altair_chart(
+            alt.Chart(school_funnel).mark_bar().encode(
+                x=alt.X("stage:N", title="Stage", sort=["userlogin","createclass","createassessment","gradesubmission","updatefeedback","updaterubric"]),
+                y=alt.Y("percent:Q", title="% of observed teachers"),
+                column=alt.Column("school:N", title="School"),
+                tooltip=["school","stage","percent"],
+            ).resolve_scale(y='independent'),
+            use_container_width=True,
+        )
+    else:
+        st.info("No school funnel data in the current filters.")
 
     # Retention by school (stacked buckets)
     st.markdown("### Retention by School (stacked)")
@@ -485,22 +455,25 @@ with schools_tab:
     ret_days["bucket"] = ret_days["days"].apply(bucket)
     ret_stack = ret_days.groupby(["school","bucket"]).size().reset_index(name="teachers")
 
-    st.altair_chart(
-        alt.Chart(ret_stack).mark_bar().encode(
-            x=alt.X("school:N", title="School"),
-            y=alt.Y("teachers:Q", title="# Teachers"),
-            color=alt.Color("bucket:N", title="Retention"),
-            order=alt.Order('bucket', sort='ascending'),
-            tooltip=["school","bucket","teachers"],
-        ), use_container_width=True
-    )
+    if not ret_stack.empty:
+        st.altair_chart(
+            alt.Chart(ret_stack).mark_bar().encode(
+                x=alt.X("school:N", title="School"),
+                y=alt.Y("teachers:Q", title="# Teachers"),
+                color=alt.Color("bucket:N", title="Retention"),
+                order=alt.Order('bucket', sort='ascending'),
+                tooltip=["school","bucket","teachers"],
+            ), use_container_width=True
+        )
+    else:
+        st.info("No school retention data in the current filters.")
 
 # ----------------------------
 # Diagnostics – AI Trust & Students
 # ----------------------------
 with diag_tab:
     st.subheader("Diagnostics – AI Trust & Student Activity")
-    view_logs = apply_data_filters(logs)
+    view_logs = apply_data_filters(logs, date_range, selected_schools, session_filter_mode)
 
     # AI Trust (rubric/feedback edits)
     st.markdown("### AI Trust: Edits vs Overrides")
@@ -514,10 +487,13 @@ with diag_tab:
     }).fillna("Other")
     trust_summary = fb.groupby("kind").size().reset_index(name="count")
     show_df(trust_summary)
-    st.altair_chart(
+    if not trust_summary.empty:
+        st.altair_chart(
         alt.Chart(trust_summary).mark_bar().encode(x="kind:N", y="count:Q", tooltip=["kind","count"]),
         use_container_width=True
     )
+    else:
+        st.info("No AI trust edit/override events in the current filters.")
 
     # Student activity distribution
     st.markdown("### Student Activity Distribution")
