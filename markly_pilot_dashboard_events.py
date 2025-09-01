@@ -3,6 +3,7 @@ import pandas as pd
 import numpy as np
 import json
 import matplotlib.pyplot as plt
+import plotly.express as px  # Add at the top if not already imported
 
 st.set_page_config(page_title="Mark.ly Pilot Dashboard (Event Logs)", layout="wide")
 
@@ -227,6 +228,11 @@ else:
     df["School"] = np.where(mapped_school.notna(), mapped_school, df["School"])
     df["School"] = np.where(df["School"].isna() & domain_school.notna(), domain_school, df["School"])
 
+    # Only keep rows where email is in EMAIL_TO_SCHOOL
+    valid_emails = set(EMAIL_TO_SCHOOL.keys())
+    df["email"] = df["email"].astype(str).str.strip().str.lower()
+    df = df[df["email"].isin(valid_emails)]
+
     # Validate required columns
     missing = [c for c in ["@timestamp", "event_name", "email"] if c not in df.columns]
     if missing:
@@ -277,13 +283,21 @@ else:
     with c6:
         st.metric("Teachers with ≥2 Active Days", f"{repeat_count} ({pct_repeat:.1f}%)")
     with c7:
-        fig = plt.figure(figsize=(6,4))
-        day_counts = days_per_teacher.value_counts().sort_index()
-        plt.bar(day_counts.index, day_counts.values)
-        plt.xlabel("Unique Active Days (per Teacher)")
-        plt.ylabel("Teachers")
-        plt.title("Distribution of Unique Active Days")
-        st.pyplot(fig)
+        # Prepare data for Plotly
+        plot_df = pd.DataFrame({
+            "email": days_per_teacher.index,
+            "active_days": days_per_teacher.values
+        })
+        fig = px.bar(
+            plot_df,
+            x="active_days",
+            y="email",
+            orientation="h",
+            hover_data=["email", "active_days"],
+            labels={"active_days": "Unique Active Days", "email": "Teacher Email"},
+            title="Distribution of Unique Active Days"
+        )
+        st.plotly_chart(fig, use_container_width=True)
 
     # Export: Summary table
     summary_df = pd.DataFrame({
