@@ -229,7 +229,7 @@ def compute_trust_ratio(df: pd.DataFrame, window_minutes=5):
     repl_df = pd.DataFrame(repl)
     repl_counts = repl_df.groupby("user_id").size().rename("replacement_events") if not repl_df.empty else pd.Series(dtype=int, name="replacement_events")
 
-    all_users = pd.Index(df["user_id"].astype[str].unique())
+    all_users = pd.Index(df["user_id"].astype(str).unique())
     out = pd.DataFrame(index=all_users)
     out = out.join(trust_counts, how="left").join(del_counts, how="left").join(create_counts, how="left").join(repl_counts, how="left")
     out = out.fillna(0).astype(int)
