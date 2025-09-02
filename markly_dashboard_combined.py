@@ -132,11 +132,15 @@ def extract_generic_ids(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def show_df(df: pd.DataFrame):
-    """Render dataframe using new width API when available, fallback otherwise."""
+    """Render dataframe with robust fallbacks across Streamlit versions."""
     try:
+        # Newer Streamlit supports width="stretch"
         st.dataframe(df, width="stretch")
-    except TypeError:
-        st.dataframe(df, use_container_width=True)
+    except Exception:
+        try:
+            st.dataframe(df, use_container_width=True)
+        except Exception as e:
+            st.warning(f"Could not render table: {e}")
 
 
 def apply_session_filter(df: pd.DataFrame, mode: str) -> pd.DataFrame:
@@ -252,13 +256,18 @@ logs["is_onboarding"] = logs.apply(in_school_session, axis=1)
 # ============================
 
 # Compute school list and date range (after session filter so onboarding logic applies)
-preview_for_filters = apply_session_filter(logs, session_filter_mode).copy()
-all_schools = sorted(preview_for_filters["school"].dropna().unique().tolist())
-# Robust min/max for mixed-type date columns
-_dl = pd.to_datetime(preview_for_filters["date_local"], errors="coerce")
-_min_ts = _dl.min()
-_max_ts = _dl.max()
-_default_range = None if (pd.isna(_min_ts) or pd.isna(_max_ts)) else (_min_ts.date(), _max_ts.date())
+try:
+    preview_for_filters = apply_session_filter(logs, session_filter_mode).copy()
+    all_schools = sorted(preview_for_filters["school"].dropna().unique().tolist())
+    # Robust min/max for mixed-type date columns
+    _dl = pd.to_datetime(preview_for_filters["date_local"], errors="coerce")
+    _min_ts = _dl.min()
+    _max_ts = _dl.max()
+    _default_range = None if (pd.isna(_min_ts) or pd.isna(_max_ts)) else (_min_ts.date(), _max_ts.date())
+except Exception as e:
+    all_schools = []
+    _default_range = None
+    st.sidebar.warning(f"Filters unavailable due to data issue: {e}")
 
 # Sidebar: School multiselect + Date range
 st.sidebar.markdown("### Data Filters")
@@ -270,7 +279,16 @@ selected_schools = st.sidebar.multiselect(
 # Streamlit date_input requires a concrete default; fall back to last 30 days if unknown
 try:
     if _default_range:
-        date_range = st.sidebar.date_input("Date range (local)", value=_default_range)
+        # Streamlit date_input requires a concrete default; fall back to last 30 days if unknown
+try:
+    if _default_range:
+        date_range = st.sidebar.date_input("Date range (local)", value=_default_range, key="date_range")
+    else:
+        _today = pd.Timestamp.utcnow().tz_localize(None).date()
+        date_range = st.sidebar.date_input("Date range (local)", value=(_today - timedelta(days=30), _today), key="date_range")
+except Exception:
+    _today = pd.Timestamp.utcnow().tz_localize(None).date()
+    date_range = st.sidebar.date_input("Date range (local)", value=(_today - timedelta(days=30), _today), key="date_range"), value=_default_range)
     else:
         _today = pd.Timestamp.utcnow().tz_localize(None).date()
         date_range = st.sidebar.date_input("Date range (local)", value=(_today - timedelta(days=30), _today))
